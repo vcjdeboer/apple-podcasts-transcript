@@ -4,21 +4,20 @@ Headless Apple Podcasts transcript fetcher for [swamp](https://swamp-club.com).
 Reads the local Apple Podcasts library (`MTLibrary.sqlite`) to find episodes,
 and downloads their TTML transcripts via the
 [FetchTranscript](https://github.com/dado3212/apple-podcast-transcript-downloader)
-binary — the same source Podcasts.app hits internally, minus the app UI. Falls
-back to a Podcasting 2.0 `<podcast:transcript>` RSS element when a show
-publishes one.
+binary, with a Podcasting 2.0 `<podcast:transcript>` RSS fallback for shows
+that publish transcripts in their feed.
 
-No Podcasts.app opening. No mouse driving. No window management.
+Pure subprocess + HTTP. No GUI, no window management.
 
 ## Requirements
 
 - macOS with Apple Podcasts installed and signed in (populates `MTLibrary.sqlite`).
 - **You must be signed in to your Apple ID on this Mac** (Apple menu → System
   Settings → Apple ID). `FetchTranscript` authenticates by asking `amsd`, the
-  Apple Media Services daemon, to sign the transcript request on your behalf —
-  the same way Podcasts.app authenticates. If you sign out, `amsd` has no
-  identity to sign with and `FetchTranscript` fails. Signing back in restores
-  it; nothing in this extension caches the underlying credentials.
+  Apple Media Services daemon, to sign the transcript request on your behalf.
+  If you sign out, `amsd` has no identity to sign with and `FetchTranscript`
+  fails. Signing back in restores it; nothing in this extension caches the
+  underlying credentials.
 - `FetchTranscript` binary on `PATH` (or full path via the `fetchTranscriptBin`
   global argument). Build from source:
 
@@ -50,54 +49,69 @@ Type: `@vcjdeboer/apple-podcasts-transcript`
 
 ### Methods
 
-**`search`** — substring-match the local library.
+**`search`** — substring-match the local library. Returns a `matches` resource
+with each candidate episode's store ID, title, feed URL, and enclosure URL.
 
-```
-swamp model @<type> method run search <name> \
-  --input '{ "podcast": "Practical AI", "episode": "Building Durable", "limit": 5 }'
-```
-
-Writes a `matches` resource with the candidate episodes' store IDs, titles,
-feed URLs, and enclosure URLs.
-
-**`fetch`** — download a transcript by Apple `storeId`.
-
-```
-swamp model @<type> method run fetch <name> \
-  --input '{ "storeId": "1000776095061" }'
-```
-
-Tries `FetchTranscript` first (covers everything Apple has auto-transcribed);
-if that returns nothing, tries the show's RSS `<podcast:transcript>` element.
-Writes a `transcript_<id>.ttml` and a slugified `.txt` into `outputDir` and
-records an `episode` resource with paths, byte counts, and the source used
+**`fetch`** — download a transcript by Apple `storeId`. Tries `FetchTranscript`
+first (covers everything Apple has auto-transcribed); if that returns nothing,
+tries the show's RSS `<podcast:transcript>` element. Writes a
+`transcript_<id>.ttml` and a slugified `.txt` into `outputDir` and records an
+`episode` resource with paths, byte counts, and the source used
 (`fetchtranscript` or `rss`).
 
-Fails hard when neither path yields a transcript (Apple has no TTML AND the RSS
-feed has no `<podcast:transcript>` element). This matches the failure surface of
-the older GUI-driven flow, but with a fast, explicit HTTP 404 instead of a
-silent no-op after a 20-second wait.
+Fails when neither path yields a transcript — Apple has no TTML AND the RSS
+feed has no `<podcast:transcript>` element. Returns an explicit HTTP 404 from
+`FetchTranscript` so the failure reason is legible.
 
-## Typical use
+## Example: Adam Jacob on The Changelog
+
+Adam Jacob (founder of Chef, System Initiative) went on The Changelog to talk
+about the swamp project itself — "Automation at the speed of Swamp" (2026-05-13).
+Fitting example.
+
+Find the episode:
 
 ```
-# 1. Find the episode.
-swamp model @vcjdeboer/apple-podcasts-transcript method run search find \
-  --input '{ "podcast": "Practical AI", "limit": 1 }'
-swamp data get find matches --json | jq '.content.matches[0].storeId'
+swamp model @vcjdeboer/apple-podcasts-transcript method run search jacob \
+  --input '{ "podcast": "Changelog", "episode": "Swamp", "limit": 3 }'
 
-# 2. Fetch it.
-swamp model @vcjdeboer/apple-podcasts-transcript method run fetch grab \
-  --input '{ "storeId": "1000776095061" }'
-swamp data get grab episode --json | jq '.content.textPath'
+swamp data get jacob matches --json | jq -r '.content.matches[] |
+  "\(.storeId)  \(.episodeTitle)  (\(.publishedAt))"'
 ```
 
-## Coverage
+Output:
 
-Byte-identical to what `Podcasts.app` caches when clicked. Verified on 9/9 known-
-good TTMLs from an earlier session; the one episode without a cached TTML in the
-same library returned an HTTP 404 from `FetchTranscript` — the same coverage
-limit as the app.
+```
+1000767804132  Automation at the speed of Swamp (Friends)  (2026-05-13 21:00:00)
+```
+
+Fetch its transcript:
+
+```
+swamp model @vcjdeboer/apple-podcasts-transcript method run fetch jacob \
+  --input '{ "storeId": "1000767804132" }'
+
+swamp data get jacob episode --json | jq '{
+  source: .content.source,
+  ttmlBytes: .content.ttmlBytes,
+  textChars: .content.textChars,
+  textPath: .content.textPath
+}'
+```
+
+Output:
+
+```json
+{
+  "source": "fetchtranscript",
+  "ttmlBytes": 2296968,
+  "textChars": 144844,
+  "textPath": "./transcripts/The-Changelog-Software-Development-Open-Source_Automation-at-the-speed-of-Swamp-Friends.txt"
+}
+```
+
+Sub-second after the FetchTranscript bearer token is cached (first call caches
+it for 30 days).
 
 ## License
 

@@ -16,11 +16,8 @@
  *   Writes TTML + a stripped plaintext to `outputDir` and records the episode's
  *   metadata as an `episode` data version.
  *
- * Why headless: previous flow drove Podcasts.app via cliclick + AppleScript
- * (mouse warp, scroll wheel, click Transcript pane). It worked but blocked the
- * GUI, took 20-30 s/episode, and collided under parallel invocations. This
- * extension replaces that entire dance with a subprocess call — sub-second
- * after the FetchTranscript bearer token is cached (30-day cache).
+ * Pure subprocess + HTTP. No GUI. Sub-second per episode once the
+ * FetchTranscript bearer token is cached (first call caches it for 30 days).
  *
  * Dependencies (macOS):
  *   - `FetchTranscript` binary on PATH (or full path via `fetchTranscriptBin`).
@@ -329,7 +326,7 @@ async function lookupByStoreId(
  */
 export const model = {
   type: "@vcjdeboer/apple-podcasts-transcript",
-  version: "2026.07.10.1",
+  version: "2026.07.10.4",
   globalArguments: GlobalArgsSchema,
   resources: {
     "matches": {

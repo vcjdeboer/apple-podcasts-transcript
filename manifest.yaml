@@ -1,0 +1,21 @@
+manifestVersion: 1
+name: "@vcjdeboer/apple-podcasts-transcript"
+version: "2026.07.10.1"
+description: "Headless Apple Podcasts transcript fetcher. Reads the local Apple Podcasts library (MTLibrary.sqlite) to find episodes, and downloads their TTML transcripts via the FetchTranscript binary (Apple's private frameworks — same source as Podcasts.app) with a Podcasting 2.0 `<podcast:transcript>` RSS fallback. No Podcasts.app opening, no mouse driving, no window management. Two methods: `search` — MTLibrary substring lookup returning matching episodes; `fetch` — by store_id, tries FetchTranscript then RSS, writes TTML + plaintext to the output directory and records episode metadata as data."
+repository: "https://github.com/vcjdeboer/apple-podcasts-transcript"
+
+paths:
+  base: manifest
+
+models:
+  - apple_podcasts_transcript.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - podcasts
+  - apple
+  - transcripts
+  - macos

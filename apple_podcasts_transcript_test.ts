@@ -155,6 +155,7 @@ function testGlobals(dir: string, bin: string) {
     fetchTranscriptBin: bin,
     outputDir: dir,
     feedTimeoutSec: 30,
+    keepTtml: false,
   };
 }
 

@@ -45,6 +45,12 @@ const GlobalArgsSchema = z.object({
   outputDir: z.string().default("./transcripts"),
   /** RSS fetch timeout, seconds. */
   feedTimeoutSec: z.number().int().min(1).default(30),
+  /**
+   * Keep the raw TTML/RSS source file after extracting plaintext. Default
+   * false — the source file is a caching intermediate. Set true if you need
+   * the TTML XML for timing data or downstream tooling.
+   */
+  keepTtml: z.boolean().default(false),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
@@ -326,7 +332,7 @@ async function lookupByStoreId(
  */
 export const model = {
   type: "@vcjdeboer/apple-podcasts-transcript",
-  version: "2026.07.10.4",
+  version: "2026.07.14.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "matches": {
@@ -414,6 +420,14 @@ export const model = {
           }.txt`;
           await Deno.writeTextFile(textPath, text);
           const st = await Deno.stat(ft.ttmlPath);
+          const ttmlBytes = st.size;
+          // Discard the raw TTML unless the caller opted in — it's a caching
+          // intermediate, and downstream tools want the .txt.
+          let recordedTtmlPath = ft.ttmlPath;
+          if (!g.keepTtml) {
+            await Deno.remove(ft.ttmlPath);
+            recordedTtmlPath = "";
+          }
           const handle = await ctx.writeResource(
             "episode",
             safeName(args.storeId),
@@ -425,9 +439,9 @@ export const model = {
               feedUrl: ep.feedUrl,
               enclosureUrl: ep.enclosureUrl,
               source: "fetchtranscript",
-              ttmlPath: ft.ttmlPath,
+              ttmlPath: recordedTtmlPath,
               textPath,
-              ttmlBytes: st.size,
+              ttmlBytes,
               textChars: text.length,
               fetchedAt: new Date().toISOString(),
             },
@@ -444,7 +458,13 @@ export const model = {
         const rss = await tryRssTranscript(g, ep);
         if (rss) {
           const st = await Deno.stat(rss.ttmlPath);
+          const rssBytes = st.size;
           const text = await Deno.readTextFile(rss.textPath);
+          let recordedRssPath = rss.ttmlPath;
+          if (!g.keepTtml) {
+            await Deno.remove(rss.ttmlPath);
+            recordedRssPath = "";
+          }
           const handle = await ctx.writeResource(
             "episode",
             safeName(args.storeId),
@@ -456,9 +476,9 @@ export const model = {
               feedUrl: ep.feedUrl,
               enclosureUrl: ep.enclosureUrl,
               source: "rss",
-              ttmlPath: rss.ttmlPath,
+              ttmlPath: recordedRssPath,
               textPath: rss.textPath,
-              ttmlBytes: st.size,
+              ttmlBytes: rssBytes,
               textChars: text.length,
               fetchedAt: new Date().toISOString(),
             },

@@ -3,8 +3,13 @@
  *
  * Two methods:
  *
- *   `search` — substring-match the local MTLibrary.sqlite by podcast and/or
- *   episode title, return matching episodes as a `matches` data version.
+ *   `search` — find episodes as a `matches` data version. Two sources:
+ *     - `source=library` (default): substring-match the local MTLibrary.sqlite
+ *       — only sees episodes the Podcasts app has already synced.
+ *     - `source=catalog`: substring-match Apple's PUBLIC catalog
+ *       (itunes.apple.com) — needs no app, no library, no sign-in, so it finds
+ *       brand-new episodes you have not opened the app for. Requires a
+ *       `podcast` term.
  *
  *   `fetch` — by episode `storeId`, download the TTML transcript. Tries in
  *   order:
@@ -25,8 +30,11 @@
  *     Build: clang -Wno-objc-method-access -framework Foundation
  *            -F/System/Library/PrivateFrameworks -framework AppleMediaServices
  *            FetchTranscript.m -o FetchTranscript
- *   - `sqlite3` CLI (macOS ships one).
- *   - Apple Podcasts app installed and signed in (MTLibrary populated).
+ *   - `sqlite3` CLI (macOS ships one) — only for `search source=library`.
+ *   - Apple Podcasts app installed with MTLibrary populated — only for
+ *     `search source=library`. `search source=catalog` and `fetch` need
+ *     neither the app nor the library; `fetch` needs a signed-in Apple ID on
+ *     the Mac (the amsd daemon signs FetchTranscript's token request).
  *
  * @module
  */
@@ -64,6 +72,14 @@ const SearchArgsSchema = z.object({
   episode: z.string().default(""),
   /** Cap on returned rows. */
   limit: z.number().int().min(1).max(500).default(20),
+  /**
+   * Where to search. `library` (default) reads the local MTLibrary.sqlite —
+   * only sees episodes the Podcasts app has synced. `catalog` queries Apple's
+   * PUBLIC catalog (itunes.apple.com) — needs no app, no library, no sign-in,
+   * so it finds brand-new episodes you haven't opened the app for. `catalog`
+   * requires a `podcast` term.
+   */
+  source: z.enum(["library", "catalog"]).default("library"),
 });
 
 const EpisodeRefSchema = z.object({
@@ -322,6 +338,152 @@ async function lookupByStoreId(
 }
 
 /* =============================================================================
+ * Public-catalog search (iTunes lookup API) — the app-independent path
+ *
+ * `search` with `source=library` reads MTLibrary.sqlite, so it can only see
+ * episodes the Podcasts app has already synced. These helpers implement
+ * `source=catalog`: they resolve a show and its episodes from Apple's PUBLIC
+ * catalog (itunes.apple.com), which needs no app, no library, and no sign-in —
+ * yielding a store_id that `fetch` can hand straight to FetchTranscript.
+ * ========================================================================== */
+
+const ITUNES = "https://itunes.apple.com";
+
+/** Normalize an iTunes ISO releaseDate ("2026-08-12T07:00:00Z") to the
+ * library's display form ("2026-08-12 07:00:00"). Idempotent. */
+export function normalizeReleaseDate(iso: string): string {
+  if (!iso) return "";
+  return iso.replace("T", " ").replace(/\.\d+/, "").replace(/Z$/, "").trim();
+}
+
+interface PodcastMatch {
+  collectionId: string;
+  feedUrl: string;
+  collectionName: string;
+}
+
+/**
+ * Choose a show from iTunes podcast-search results: prefer an exact
+ * case-insensitive `collectionName` match, else iTunes' own top-ranked result.
+ * Returns null when there are no usable results.
+ */
+export function pickPodcastMatch(
+  results: unknown[],
+  podcast: string,
+): PodcastMatch | null {
+  const rows = (results ?? []).filter(
+    (r): r is Record<string, unknown> =>
+      !!r && typeof r === "object" && "collectionId" in r,
+  );
+  if (rows.length === 0) return null;
+  const want = podcast.trim().toLowerCase();
+  const exact = rows.find(
+    (r) => String(r.collectionName ?? "").trim().toLowerCase() === want,
+  );
+  const chosen = exact ?? rows[0];
+  return {
+    collectionId: String(chosen.collectionId ?? ""),
+    feedUrl: String(chosen.feedUrl ?? ""),
+    collectionName: String(chosen.collectionName ?? ""),
+  };
+}
+
+/**
+ * Map iTunes lookup rows to EpisodeRef[], newest first. The lookup response
+ * leads with a collection row (wrapperType "track") — skipped here — followed
+ * by `podcastEpisode` rows. Filters by episode-title substring when given, and
+ * backfills a missing per-episode feedUrl with the show's feed.
+ */
+export function parseCatalogEpisodes(
+  results: unknown[],
+  episode: string,
+  limit: number,
+  fallbackFeedUrl: string,
+): Array<z.infer<typeof EpisodeRefSchema>> {
+  const want = episode.trim().toLowerCase();
+  const rows = (results ?? [])
+    .filter(
+      (r): r is Record<string, unknown> =>
+        !!r && typeof r === "object" &&
+        (r as Record<string, unknown>).wrapperType === "podcastEpisode",
+    )
+    .filter((r) =>
+      r.trackId !== undefined && r.trackId !== null &&
+      String(r.trackId) !== ""
+    )
+    .filter((r) =>
+      !want || String(r.trackName ?? "").toLowerCase().includes(want)
+    )
+    .map((r) => ({
+      storeId: String(r.trackId),
+      podcastTitle: String(r.collectionName ?? ""),
+      episodeTitle: String(r.trackName ?? ""),
+      publishedAt: normalizeReleaseDate(String(r.releaseDate ?? "")),
+      feedUrl: String(r.feedUrl ?? "") || fallbackFeedUrl,
+      enclosureUrl: String(r.episodeUrl ?? r.previewUrl ?? ""),
+    }));
+  // "YYYY-MM-DD HH:MM:SS" sorts lexicographically == chronologically.
+  rows.sort((a, b) =>
+    a.publishedAt < b.publishedAt ? 1 : a.publishedAt > b.publishedAt ? -1 : 0
+  );
+  return rows.slice(0, limit);
+}
+
+/**
+ * App-independent search: resolve a show in Apple's PUBLIC catalog, then list
+ * its episodes — no MTLibrary, no Podcasts app, no sign-in. `fetchImpl` is
+ * injectable for testing. Returns [] when the show isn't found.
+ */
+export async function searchCatalog(
+  opts: {
+    podcast: string;
+    episode: string;
+    limit: number;
+    timeoutSec?: number;
+  },
+  fetchImpl: typeof fetch = fetch,
+): Promise<Array<z.infer<typeof EpisodeRefSchema>>> {
+  const term = opts.podcast.trim();
+  if (!term) {
+    throw new Error(
+      "catalog search requires a 'podcast' term (the show name) — " +
+        "episode-only catalog search isn't supported",
+    );
+  }
+  // Bound both network calls so a hung iTunes connection can't hang the method.
+  const timeoutMs = (opts.timeoutSec ?? 30) * 1000;
+  const searchUrl = `${ITUNES}/search?media=podcast&limit=5&term=${
+    encodeURIComponent(term)
+  }`;
+  const sres = await fetchImpl(searchUrl, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!sres.ok) throw new Error(`iTunes search failed: HTTP ${sres.status}`);
+  const sjson = await sres.json() as { results?: unknown[] };
+  const pod = pickPodcastMatch(sjson.results ?? [], opts.podcast);
+  if (!pod) return [];
+  // Request extra rows so an episode-substring filter has candidates to match;
+  // parseCatalogEpisodes caps the final result at `limit`.
+  const lookupCount = opts.episode.trim()
+    ? 200
+    : Math.min(200, Math.max(1, opts.limit) + 1);
+  const lookupUrl = `${ITUNES}/lookup?id=${
+    encodeURIComponent(pod.collectionId)
+  }&media=podcast&entity=podcastEpisode&limit=${lookupCount}`;
+  const lres = await fetchImpl(lookupUrl, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!lres.ok) throw new Error(`iTunes lookup failed: HTTP ${lres.status}`);
+  const ljson = await lres.json() as { results?: unknown[] };
+  return parseCatalogEpisodes(
+    ljson.results ?? [],
+    opts.episode,
+    opts.limit,
+    pod.feedUrl,
+  );
+}
+
+/* =============================================================================
  * Model
  * ========================================================================== */
 
@@ -332,12 +494,12 @@ async function lookupByStoreId(
  */
 export const model = {
   type: "@vcjdeboer/apple-podcasts-transcript",
-  version: "2026.07.14.1",
+  version: "2026.08.14.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "matches": {
       description:
-        "Result of a MTLibrary search: candidate episodes with store_id, feed and enclosure URLs",
+        "Result of a search (local library or public Apple catalog): candidate episodes with store_id, feed and enclosure URLs",
       schema: SearchResultSchema,
       lifetime: "infinite",
       garbageCollection: 100,
@@ -353,28 +515,39 @@ export const model = {
   methods: {
     search: {
       description:
-        "Substring-match MTLibrary.sqlite by podcast and/or episode title; returns candidate episodes with feed and enclosure URLs",
+        "Find episodes by podcast and/or episode title. source=library (default) reads local MTLibrary.sqlite; source=catalog queries Apple's public catalog (no app/library/sign-in needed, finds un-synced episodes)",
       arguments: SearchArgsSchema,
       execute: async (
         args: z.infer<typeof SearchArgsSchema>,
         ctx: Ctx,
       ): Promise<{ dataHandles: unknown[] }> => {
-        const clauses: string[] = ["1=1"];
-        const binds: string[] = [];
-        if (args.podcast) {
-          clauses.push("LOWER(pod.ZTITLE) LIKE ?");
-          binds.push(`%${args.podcast.toLowerCase()}%`);
+        let rows: Array<z.infer<typeof EpisodeRefSchema>>;
+        if (args.source === "catalog") {
+          // Public Apple catalog — no MTLibrary, no app, no sign-in.
+          rows = await searchCatalog({
+            podcast: args.podcast,
+            episode: args.episode,
+            limit: args.limit,
+            timeoutSec: ctx.globalArgs.feedTimeoutSec,
+          });
+        } else {
+          const clauses: string[] = ["1=1"];
+          const binds: string[] = [];
+          if (args.podcast) {
+            clauses.push("LOWER(pod.ZTITLE) LIKE ?");
+            binds.push(`%${args.podcast.toLowerCase()}%`);
+          }
+          if (args.episode) {
+            clauses.push("LOWER(ep.ZTITLE) LIKE ?");
+            binds.push(`%${args.episode.toLowerCase()}%`);
+          }
+          rows = await queryMtlibrary(
+            ctx.globalArgs,
+            clauses.join(" AND "),
+            binds,
+            args.limit,
+          );
         }
-        if (args.episode) {
-          clauses.push("LOWER(ep.ZTITLE) LIKE ?");
-          binds.push(`%${args.episode.toLowerCase()}%`);
-        }
-        const rows = await queryMtlibrary(
-          ctx.globalArgs,
-          clauses.join(" AND "),
-          binds,
-          args.limit,
-        );
         const instance = safeName(
           [args.podcast, args.episode].filter(Boolean).join("-") || "any",
         );
@@ -385,8 +558,13 @@ export const model = {
           searchedAt: new Date().toISOString(),
         });
         ctx.logger.info(
-          "Search podcast~{p} episode~{e}: {n} matches",
-          { p: args.podcast || "*", e: args.episode || "*", n: rows.length },
+          "Search[{src}] podcast~{p} episode~{e}: {n} matches",
+          {
+            src: args.source,
+            p: args.podcast || "*",
+            e: args.episode || "*",
+            n: rows.length,
+          },
         );
         return { dataHandles: [handle] };
       },

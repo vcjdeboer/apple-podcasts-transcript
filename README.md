@@ -1,13 +1,26 @@
 # @vcjdeboer/apple-podcasts-transcript
 
 Headless Apple Podcasts transcript fetcher for [swamp](https://swamp-club.com).
-Reads the local Apple Podcasts library (`MTLibrary.sqlite`) to find episodes,
-and downloads their TTML transcripts via the
+Finds episodes — either in the local Apple Podcasts library (`MTLibrary.sqlite`)
+or in Apple's public catalog — and downloads their TTML transcripts via the
 [FetchTranscript](https://github.com/dado3212/apple-podcast-transcript-downloader)
 binary, with a Podcasting 2.0 `<podcast:transcript>` RSS fallback for shows
 that publish transcripts in their feed.
 
 Pure subprocess + HTTP. No GUI, no window management.
+
+### Do I need the Podcasts app open?
+
+**No — and for new episodes you should not rely on it.** The transcript download
+(`fetch`) needs only a `storeId`, a network connection, and a signed-in Apple ID
+— never the app, never the local library. The one part that reads the local
+library is `search source=library` (the default): it can only see episodes the
+Podcasts app has already **synced**, so a brand-new episode you have not opened
+the app for is invisible to it — and with no `storeId`, you cannot start a fetch.
+
+Use **`search source=catalog`** to look the episode up in Apple's public catalog
+instead. It needs no app, no library, and no sign-in, so it finds episodes the
+moment Apple lists them — then hand the returned `storeId` to `fetch`.
 
 ## Requirements
 
@@ -49,8 +62,16 @@ Type: `@vcjdeboer/apple-podcasts-transcript`
 
 ### Methods
 
-**`search`** — substring-match the local library. Returns a `matches` resource
-with each candidate episode's store ID, title, feed URL, and enclosure URL.
+**`search`** — find candidate episodes. Returns a `matches` resource with each
+episode's store ID, title, feed URL, and enclosure URL. Two sources via the
+`source` argument:
+
+- `source=library` (default) — substring-match the local `MTLibrary.sqlite`.
+  Only sees episodes the Podcasts app has synced.
+- `source=catalog` — substring-match Apple's public catalog
+  (`itunes.apple.com`). No app, library, or sign-in required; finds un-synced
+  episodes. Requires a `podcast` term (the show name); `episode` narrows within
+  the show; `limit` caps rows.
 
 **`fetch`** — download a transcript by Apple `storeId`. Tries `FetchTranscript`
 first (covers everything Apple has auto-transcribed); if that returns nothing,
@@ -112,6 +133,26 @@ Output:
 
 Sub-second after the FetchTranscript bearer token is cached (first call caches
 it for 30 days).
+
+## Example: a brand-new episode, without opening the app
+
+You want the latest episode of a show you follow, but you have not opened the
+Podcasts app since it published — so `source=library` finds nothing. Look it up
+in the public catalog instead, then fetch by the `storeId` it returns:
+
+```
+swamp model @vcjdeboer/apple-podcasts-transcript method run search pe \
+  --input '{ "source": "catalog", "podcast": "The Pragmatic Engineer", "limit": 3 }'
+
+swamp data get pe matches --json | jq -r '.content.matches[] |
+  "\(.storeId)  \(.publishedAt)  \(.episodeTitle)"'
+# 1000782993949  2026-08-12 16:45:07  Stop being skeptical about AI for development ...
+
+swamp model @vcjdeboer/apple-podcasts-transcript method run fetch pe \
+  --input '{ "storeId": "1000782993949" }'
+```
+
+No app, no sync, no sign-in for the lookup — only `fetch` needs the Apple ID.
 
 ## License
 

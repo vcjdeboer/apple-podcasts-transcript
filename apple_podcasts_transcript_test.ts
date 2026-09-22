@@ -19,6 +19,9 @@ import {
   assertStringIncludes,
 } from "jsr:@std/assert@1";
 import {
+  lookupCatalogByStoreId,
+  parseAmpEpisode,
+  resolveEpisodeRef,
   normalizeReleaseDate,
   parseCatalogEpisodes,
   pickPodcastMatch,
@@ -35,8 +38,8 @@ import {
  * ========================================================================== */
 Deno.test("slugify: basic ASCII collapses runs of punctuation to single dashes", () => {
   assertEquals(
-    slugify("The Stack Overflow Podcast"),
-    "The-Stack-Overflow-Podcast",
+    slugify("The Example Tech Podcast"),
+    "The-Example-Tech-Podcast",
   );
   assertEquals(slugify("Hello, world!"), "Hello-world");
 });
@@ -277,30 +280,30 @@ Deno.test("normalizeReleaseDate: empty input yields empty string", () => {
 Deno.test("pickPodcastMatch: returns the first result's id and feed when only one match", () => {
   const results = [
     {
-      collectionId: 1769051199,
-      collectionName: "The Pragmatic Engineer",
-      feedUrl: "https://api.substack.com/feed/podcast/458709.rss",
+      collectionId: 1000000000003,
+      collectionName: "The Example Show",
+      feedUrl: "https://example.com/feed/sample.rss",
     },
   ];
-  const m = pickPodcastMatch(results, "pragmatic");
-  assertEquals(m?.collectionId, "1769051199");
-  assertEquals(m?.feedUrl, "https://api.substack.com/feed/podcast/458709.rss");
+  const m = pickPodcastMatch(results, "example");
+  assertEquals(m?.collectionId, "1000000000003");
+  assertEquals(m?.feedUrl, "https://example.com/feed/sample.rss");
 });
 
 Deno.test("pickPodcastMatch: prefers an exact case-insensitive name match over rank order", () => {
   const results = [
     {
       collectionId: 111,
-      collectionName: "Pragmatic Engineer Daily",
+      collectionName: "Example Show Daily",
       feedUrl: "a",
     },
     {
       collectionId: 222,
-      collectionName: "the pragmatic engineer",
+      collectionName: "the example show",
       feedUrl: "b",
     },
   ];
-  const m = pickPodcastMatch(results, "The Pragmatic Engineer");
+  const m = pickPodcastMatch(results, "The Example Show");
   assertEquals(m?.collectionId, "222");
 });
 
@@ -314,23 +317,23 @@ Deno.test("pickPodcastMatch: returns null when there are no results", () => {
 function lookupFixture() {
   return [
     // The collection row iTunes returns first — must be skipped.
-    { wrapperType: "track", kind: "podcast", collectionId: 1769051199 },
+    { wrapperType: "track", kind: "podcast", collectionId: 1000000000003 },
     {
       wrapperType: "podcastEpisode",
-      trackId: 1000776932678,
+      trackId: 1000000000004,
       trackName: "Context engineering with Dex Horthy",
-      collectionName: "The Pragmatic Engineer",
+      collectionName: "The Example Show",
       releaseDate: "2026-07-15T07:00:00Z",
-      feedUrl: "https://api.substack.com/feed/podcast/458709.rss",
+      feedUrl: "https://example.com/feed/sample.rss",
       episodeUrl: "https://example.com/dex.mp3",
     },
     {
       wrapperType: "podcastEpisode",
-      trackId: 1000782993949,
+      trackId: 1000000000005,
       trackName: "Stop being skeptical about AI for development",
-      collectionName: "The Pragmatic Engineer",
+      collectionName: "The Example Show",
       releaseDate: "2026-08-12T07:00:00Z",
-      feedUrl: "https://api.substack.com/feed/podcast/458709.rss",
+      feedUrl: "https://example.com/feed/sample.rss",
       episodeUrl: "https://example.com/charity.mp3",
     },
   ];
@@ -341,11 +344,11 @@ Deno.test("parseCatalogEpisodes: skips the collection row and maps trackId to st
   assertEquals(rows.length, 2);
   assert(rows.every((r) => r.storeId !== ""));
   const dex = rows.find((r) => r.episodeTitle.includes("Context"));
-  assertEquals(dex?.storeId, "1000776932678");
-  assertEquals(dex?.podcastTitle, "The Pragmatic Engineer");
+  assertEquals(dex?.storeId, "1000000000004");
+  assertEquals(dex?.podcastTitle, "The Example Show");
   assertEquals(
     dex?.feedUrl,
-    "https://api.substack.com/feed/podcast/458709.rss",
+    "https://example.com/feed/sample.rss",
   );
   assertEquals(dex?.enclosureUrl, "https://example.com/dex.mp3");
   assertEquals(dex?.publishedAt, "2026-07-15 07:00:00");
@@ -354,14 +357,14 @@ Deno.test("parseCatalogEpisodes: skips the collection row and maps trackId to st
 Deno.test("parseCatalogEpisodes: filters by episode substring case-insensitively", () => {
   const rows = parseCatalogEpisodes(lookupFixture(), "SKEPTICAL", 20, "");
   assertEquals(rows.length, 1);
-  assertEquals(rows[0].storeId, "1000782993949");
+  assertEquals(rows[0].storeId, "1000000000005");
 });
 
 Deno.test("parseCatalogEpisodes: sorts newest-first and caps at limit", () => {
   const rows = parseCatalogEpisodes(lookupFixture(), "", 1, "");
   assertEquals(rows.length, 1);
   // 2026-08-12 is newer than 2026-07-15 → the AI episode wins the single slot.
-  assertEquals(rows[0].storeId, "1000782993949");
+  assertEquals(rows[0].storeId, "1000000000005");
 });
 
 Deno.test("parseCatalogEpisodes: falls back to the podcast feedUrl when a row lacks one", () => {
@@ -392,9 +395,9 @@ Deno.test("searchCatalog: resolves podcast then episodes via the public API (no 
         new Response(JSON.stringify({
           resultCount: 1,
           results: [{
-            collectionId: 1769051199,
-            collectionName: "The Pragmatic Engineer",
-            feedUrl: "https://api.substack.com/feed/podcast/458709.rss",
+            collectionId: 1000000000003,
+            collectionName: "The Example Show",
+            feedUrl: "https://example.com/feed/sample.rss",
           }],
         })),
       );
@@ -408,7 +411,7 @@ Deno.test("searchCatalog: resolves podcast then episodes via the public API (no 
   }) as typeof fetch;
 
   const rows = await searchCatalog(
-    { podcast: "pragmatic engineer", episode: "", limit: 20 },
+    { podcast: "example show", episode: "", limit: 20 },
     stubFetch,
   );
   assertEquals(rows.length, 2);
@@ -421,7 +424,7 @@ Deno.test("searchCatalog: resolves podcast then episodes via the public API (no 
     "second call hits the episode lookup endpoint",
   );
   assert(
-    calls[1].includes("1769051199"),
+    calls[1].includes("1000000000003"),
     "lookup uses the resolved collectionId",
   );
 });
@@ -463,4 +466,160 @@ Deno.test("searchCatalog: throws with the HTTP status on a non-ok search respons
     Error,
     "HTTP 503",
   );
+});
+
+/* =============================================================================
+ * resolveEpisodeRef — metadata resolution order for `fetch`
+ * ========================================================================== */
+const CATALOG_REF = {
+  storeId: "1000000000001",
+  podcastTitle: "Example Audio: The Sample Podcast",
+  episodeTitle: "Sample Episode: A Generic Title",
+  publishedAt: "2026-09-21 22:13:49",
+  feedUrl: "https://example.com/feed/sample.rss",
+  enclosureUrl: "https://example.com/audio/sample.mp3",
+};
+
+Deno.test("resolveEpisodeRef: falls back to the catalog when MTLibrary has no row", async () => {
+  let catalogCalls = 0;
+  const ep = await resolveEpisodeRef(
+    "1000000000001",
+    () => Promise.resolve(null),
+    () => {
+      catalogCalls++;
+      return Promise.resolve(CATALOG_REF);
+    },
+  );
+  assertEquals(ep.podcastTitle, "Example Audio: The Sample Podcast");
+  assertEquals(ep.episodeTitle, "Sample Episode: A Generic Title");
+  assertEquals(ep.publishedAt, "2026-09-21 22:13:49");
+  assertEquals(catalogCalls, 1, "consults the catalog exactly once");
+});
+
+Deno.test("resolveEpisodeRef: prefers the library row and never hits the network", async () => {
+  let catalogCalls = 0;
+  const libRow = { ...CATALOG_REF, podcastTitle: "From Library" };
+  const ep = await resolveEpisodeRef(
+    "1000000000001",
+    () => Promise.resolve(libRow),
+    () => {
+      catalogCalls++;
+      return Promise.resolve(CATALOG_REF);
+    },
+  );
+  assertEquals(ep.podcastTitle, "From Library");
+  assertEquals(catalogCalls, 0, "library hit must not trigger a catalog call");
+});
+
+Deno.test("resolveEpisodeRef: returns blank metadata when both sources miss", async () => {
+  const ep = await resolveEpisodeRef(
+    "999",
+    () => Promise.resolve(null),
+    () => Promise.resolve(null),
+  );
+  assertEquals(ep.storeId, "999");
+  assertEquals(ep.podcastTitle, "");
+  assertEquals(ep.episodeTitle, "");
+});
+
+Deno.test("resolveEpisodeRef: a failing catalog lookup degrades to blanks, it does not throw", async () => {
+  const ep = await resolveEpisodeRef(
+    "999",
+    () => Promise.resolve(null),
+    () => Promise.reject(new Error("iTunes unreachable")),
+  );
+  assertEquals(ep.storeId, "999");
+  assertEquals(ep.podcastTitle, "");
+});
+
+/* =============================================================================
+ * parseAmpEpisode / lookupCatalogByStoreId
+ *
+ * The public iTunes lookup API does NOT resolve episode-level track ids
+ * (resultCount 0), so the catalog fallback goes through Apple's AMP catalog
+ * endpoint, which does. Fixture mirrors a real response.
+ * ========================================================================== */
+function ampFixture() {
+  return {
+    data: [{
+      id: "1000000000001",
+      attributes: {
+        name: "Sample Episode: A Generic Title \u2014 with A Guest",
+        artistName: "Example.Audio",
+        releaseDateTime: "2026-09-21T22:13:49Z",
+        assetUrl: "https://example.com/audio/sample.mp3",
+      },
+      relationships: {
+        podcast: {
+          data: [{
+            id: "1000000000002",
+            attributes: { name: "Example Audio: The Sample Podcast" },
+          }],
+        },
+      },
+    }],
+  };
+}
+
+Deno.test("parseAmpEpisode: maps an AMP episode payload onto an episode ref", () => {
+  const ep = parseAmpEpisode(ampFixture(), "1000000000001");
+  assertEquals(ep?.storeId, "1000000000001");
+  assertEquals(ep?.episodeTitle, "Sample Episode: A Generic Title \u2014 with A Guest");
+  assertEquals(ep?.publishedAt, "2026-09-21 22:13:49");
+  assertEquals(ep?.enclosureUrl, "https://example.com/audio/sample.mp3");
+});
+
+Deno.test("parseAmpEpisode: prefers the included podcast name over the episode's artistName", () => {
+  // artistName is the publisher handle ("Example.Audio"); the show's real title
+  // lives on the included podcast relationship.
+  const ep = parseAmpEpisode(ampFixture(), "1000000000001");
+  assertEquals(ep?.podcastTitle, "Example Audio: The Sample Podcast");
+});
+
+Deno.test("parseAmpEpisode: falls back to artistName when no podcast is included", () => {
+  const f = ampFixture();
+  delete (f.data[0] as Record<string, unknown>).relationships;
+  const ep = parseAmpEpisode(f, "1000000000001");
+  assertEquals(ep?.podcastTitle, "Example.Audio");
+});
+
+Deno.test("parseAmpEpisode: returns null for an empty data array", () => {
+  assertEquals(parseAmpEpisode({ data: [] }, "1000000000001"), null);
+});
+
+Deno.test("lookupCatalogByStoreId: authorizes with the web token and returns the ref", async () => {
+  const calls: string[] = [];
+  const stubFetch = ((url: string, init?: RequestInit) => {
+    calls.push(String(url));
+    const auth = new Headers(init?.headers).get("Authorization");
+    assertEquals(auth, "Bearer test-token");
+    return Promise.resolve(new Response(JSON.stringify(ampFixture())));
+  }) as typeof fetch;
+
+  const ep = await lookupCatalogByStoreId(
+    "1000000000001",
+    stubFetch,
+    30,
+    () => Promise.resolve("test-token"),
+  );
+  assertEquals(ep?.podcastTitle, "Example Audio: The Sample Podcast");
+  assert(calls[0].includes("podcast-episodes/1000000000001"), "hits the AMP episode route");
+});
+
+Deno.test("lookupCatalogByStoreId: returns null when no web token can be obtained", async () => {
+  let called = false;
+  const stubFetch = (() => {
+    called = true;
+    return Promise.resolve(new Response("{}"));
+  }) as typeof fetch;
+  const ep = await lookupCatalogByStoreId("1", stubFetch, 30, () => Promise.resolve(null));
+  assertEquals(ep, null);
+  assertEquals(called, false, "must not call AMP without a token");
+});
+
+Deno.test("lookupCatalogByStoreId: returns null on a non-ok AMP response", async () => {
+  const stubFetch = (() =>
+    Promise.resolve(new Response("nope", { status: 404 }))) as typeof fetch;
+  const ep = await lookupCatalogByStoreId("1", stubFetch, 30, () => Promise.resolve("t"));
+  assertEquals(ep, null);
 });

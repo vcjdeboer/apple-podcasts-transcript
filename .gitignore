@@ -1,3 +1,4 @@
 transcripts/
 bearer_token.txt
 .DS_Store
+.swamp/

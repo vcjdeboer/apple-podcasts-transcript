@@ -429,6 +429,127 @@ export function parseCatalogEpisodes(
   return rows.slice(0, limit);
 }
 
+const AMP = "https://amp-api.podcasts.apple.com/v1/catalog/us";
+const PODCASTS_WEB = "https://podcasts.apple.com";
+
+/**
+ * Map an AMP `/podcast-episodes/<id>` payload onto an episode ref. The show's
+ * real title lives on the included `podcast` relationship; the episode's own
+ * `artistName` is the publisher handle, not the show title, so it is only a
+ * fallback. AMP exposes no RSS feed url here, so feedUrl stays empty.
+ */
+export function parseAmpEpisode(
+  json: unknown,
+  storeId: string,
+): z.infer<typeof EpisodeRefSchema> | null {
+  const data = (json as { data?: unknown[] } | null)?.data;
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const row = data[0] as Record<string, unknown>;
+  const a = (row.attributes ?? {}) as Record<string, unknown>;
+  const rel = row.relationships as
+    | { podcast?: { data?: Array<{ attributes?: { name?: unknown } }> } }
+    | undefined;
+  const showName = rel?.podcast?.data?.[0]?.attributes?.name;
+  return {
+    storeId: String(row.id ?? storeId),
+    podcastTitle: String(showName ?? a.artistName ?? ""),
+    episodeTitle: String(a.name ?? ""),
+    publishedAt: normalizeReleaseDate(String(a.releaseDateTime ?? "")),
+    feedUrl: "",
+    enclosureUrl: String(a.assetUrl ?? ""),
+  };
+}
+
+/**
+ * Scrape the PUBLIC developer JWT that the Apple Podcasts web player ships in
+ * its JS bundle. No sign-in, no user credentials — the same token any visitor
+ * to podcasts.apple.com gets. Returns null if Apple changes the layout, which
+ * callers must treat as "no metadata", never as a hard failure.
+ */
+export async function fetchWebToken(
+  fetchImpl: typeof fetch = fetch,
+  timeoutSec = 30,
+): Promise<string | null> {
+  const page = await fetchImpl(`${PODCASTS_WEB}/us/browse`, {
+    signal: AbortSignal.timeout(timeoutSec * 1000),
+  });
+  if (!page.ok) return null;
+  const asset = (await page.text()).match(/\/assets\/index~[A-Za-z0-9]+\.js/);
+  if (!asset) return null;
+  const js = await fetchImpl(`${PODCASTS_WEB}${asset[0]}`, {
+    signal: AbortSignal.timeout(timeoutSec * 1000),
+  });
+  if (!js.ok) return null;
+  const jwt = (await js.text()).match(
+    /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  );
+  return jwt ? jwt[0] : null;
+}
+
+/**
+ * Resolve ONE episode's metadata from Apple's PUBLIC catalog by its own store
+ * id. MTLibrary only knows episodes the Podcasts app has already synced, so a
+ * freshly published episode is absent there — leaving `fetch` with blank titles
+ * and an "episode_<storeId>.txt" output name. Note the public itunes.apple.com
+ * /lookup API cannot do this (it returns resultCount 0 for episode-level track
+ * ids), hence the AMP catalog route. Returns null when unavailable.
+ */
+export async function lookupCatalogByStoreId(
+  storeId: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutSec = 30,
+  tokenProvider: (
+    f: typeof fetch,
+    t: number,
+  ) => Promise<string | null> = fetchWebToken,
+): Promise<z.infer<typeof EpisodeRefSchema> | null> {
+  const token = await tokenProvider(fetchImpl, timeoutSec);
+  if (!token) return null;
+  const url = `${AMP}/podcast-episodes/${
+    encodeURIComponent(storeId)
+  }?include%5Bpodcast-episodes%5D=podcast`;
+  const res = await fetchImpl(url, {
+    headers: { Authorization: `Bearer ${token}`, Origin: PODCASTS_WEB },
+    signal: AbortSignal.timeout(timeoutSec * 1000),
+  });
+  if (!res.ok) return null;
+  return parseAmpEpisode(await res.json(), storeId);
+}
+
+/** Blank metadata, used when neither the library nor the catalog knows it. */
+function blankEpisodeRef(storeId: string): z.infer<typeof EpisodeRefSchema> {
+  return {
+    storeId,
+    podcastTitle: "",
+    episodeTitle: "",
+    publishedAt: "",
+    feedUrl: "",
+    enclosureUrl: "",
+  };
+}
+
+/**
+ * Resolve an episode's metadata for `fetch`: the local library first (free and
+ * offline), then the public catalog (which covers episodes the Podcasts app
+ * has not synced yet), then blanks. A catalog failure is swallowed on purpose
+ * — metadata is a nice-to-have, and must never cost us the transcript.
+ */
+export async function resolveEpisodeRef(
+  storeId: string,
+  libraryLookup: () => Promise<z.infer<typeof EpisodeRefSchema> | null>,
+  catalogLookup: () => Promise<z.infer<typeof EpisodeRefSchema> | null>,
+): Promise<z.infer<typeof EpisodeRefSchema>> {
+  const fromLibrary = await libraryLookup();
+  if (fromLibrary) return fromLibrary;
+  try {
+    const fromCatalog = await catalogLookup();
+    if (fromCatalog) return fromCatalog;
+  } catch {
+    // Offline, rate-limited, or an iTunes hiccup: fall through to blanks.
+  }
+  return blankEpisodeRef(storeId);
+}
+
 /**
  * App-independent search: resolve a show in Apple's PUBLIC catalog, then list
  * its episodes — no MTLibrary, no Podcasts app, no sign-in. `fetchImpl` is
@@ -579,14 +700,11 @@ export const model = {
       ): Promise<{ dataHandles: unknown[] }> => {
         const g = ctx.globalArgs;
         await Deno.mkdir(g.outputDir, { recursive: true });
-        const ep = (await lookupByStoreId(g, args.storeId)) ?? {
-          storeId: args.storeId,
-          podcastTitle: "",
-          episodeTitle: "",
-          publishedAt: "",
-          feedUrl: "",
-          enclosureUrl: "",
-        };
+        const ep = await resolveEpisodeRef(
+          args.storeId,
+          () => lookupByStoreId(g, args.storeId),
+          () => lookupCatalogByStoreId(args.storeId, fetch, g.feedTimeoutSec),
+        );
 
         // Path 1: FetchTranscript
         const ft = await tryFetchTranscript(g, args.storeId);
